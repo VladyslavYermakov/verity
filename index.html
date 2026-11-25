@@ -12,15 +12,24 @@ h1{margin:0;padding:28px 24px 0;font-size:clamp(2rem,6vw,3.2rem);font-weight:700
 p{margin:6px 0 0;text-align:center;color:var(--mut);font-size:1rem}
 #stage{flex:1;min-height:0;cursor:grab;touch-action:none}
 #stage:active{cursor:grabbing}
+#stage.hammer{cursor:crosshair}
 canvas{display:block;width:100%;height:100%}
+#tool{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);
+  font:inherit;font-size:1.05rem;font-weight:700;padding:12px 22px;border-radius:999px;cursor:pointer;
+  color:var(--fg);background:transparent;border:2px solid var(--fg);transition:transform .12s,background .12s,color .12s}
+#tool:active{transform:translateX(-50%) scale(.94)}
+#tool.on{background:var(--fg);color:var(--bg)}
 </style>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,700&display=swap" rel="stylesheet">
 </head><body>
-<h1>Verity</h1><p>Потяни, чтобы покрутить</p>
+<h1>Verity</h1><p id="hint">Тяни шар — он растянется как слайм</p>
 <div id="stage"></div>
+<button id="tool" type="button">🔨 Молот</button>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 const stage=document.getElementById('stage');
+const toolBtn=document.getElementById('tool');
+const hint=document.getElementById('hint');
 const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
 renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.outputEncoding=THREE.sRGBEncoding;
 stage.appendChild(renderer.domElement);
@@ -28,8 +37,14 @@ const scene=new THREE.Scene();
 const camera=new THREE.PerspectiveCamera(35,1,.1,50);camera.position.z=7;
 scene.add(new THREE.AmbientLight(0xffffff,.75));
 const dl=new THREE.DirectionalLight(0xffffff,.8);dl.position.set(3,4,6);scene.add(dl);
-new THREE.AmbientLight(0xffffff,.6)
-new THREE.DirectionalLight(0xffffff,.7)
+
+/* ---------- молот ---------- */
+const hammer=new THREE.Group();
+const head=new THREE.Mesh(new THREE.BoxGeometry(1.1,.6,.6),new THREE.MeshStandardMaterial({color:0x8d949c,metalness:.7,roughness:.35}));
+head.position.y=.3;
+const handle=new THREE.Mesh(new THREE.CylinderGeometry(.08,.1,2,16),new THREE.MeshStandardMaterial({color:0x8a5a2b,roughness:.8}));
+handle.position.y=1.5;
+hammer.add(head,handle);hammer.visible=false;scene.add(hammer);
 
 const img=new Image();
 img.onload=()=>{
@@ -37,7 +52,7 @@ img.onload=()=>{
 
   const R=1.6;
   const geo=new THREE.SphereGeometry(R,128,64).toNonIndexed();
-  const pos=geo.attributes.position,uv=geo.attributes.uv;
+  const pos=geo.attributes.position,uv=geo.attributes.uv,nor=geo.attributes.normal;
   for(let i=0;i<pos.count;i+=3){
     const back=(pos.getZ(i)+pos.getZ(i+1)+pos.getZ(i+2))<0;
     for(let k=i;k<i+3;k++){
@@ -45,17 +60,106 @@ img.onload=()=>{
       uv.setXY(k,back?.5:u,back?.9:v);
     }
   }
+  const N=pos.count;
+  const ox=Float32Array.from(pos.array); // исходные позиции
+  // общие индексы одинаковых вершин — для гладких нормалей при деформации
+  const uid=new Uint32Array(N),keys=new Map();
+  for(let i=0;i<N;i++){
+    const k=Math.round(ox[i*3]*500)+'_'+Math.round(ox[i*3+1]*500)+'_'+Math.round(ox[i*3+2]*500);
+    let id=keys.get(k);if(id===undefined){id=keys.size;keys.set(k,id)}uid[i]=id;
+  }
+  const acc=new Float32Array(keys.size*3);
+  geo.computeBoundingSphere();geo.boundingSphere.radius=R*4;
+
   const ball=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({map:front,roughness:.35}));
   const g=new THREE.Group();g.add(ball);scene.add(g);
 
-  let vx=.01,vy=0,drag=false,lx=0,ly=0;
-  stage.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;stage.setPointerCapture(e.pointerId)});
-  stage.addEventListener('pointerup',()=>drag=false);
+  /* ---------- деформация (пружина) ---------- */
+  const W=new Float32Array(N);
+  const D=new THREE.Vector3(),Vd=new THREE.Vector3(),target=new THREE.Vector3();
+  let k=140,c=5,deformed=false;
+
+  function setCenter(local,sigma){
+    const s2=2*sigma*sigma;
+    for(let i=0;i<N;i++){
+      const dx=ox[i*3]-local.x,dy=ox[i*3+1]-local.y,dz=ox[i*3+2]-local.z;
+      W[i]=Math.exp(-(dx*dx+dy*dy+dz*dz)/s2);
+    }
+  }
+  function applyDeform(reset){
+    const p=pos.array;
+    for(let i=0;i<N;i++){
+      const w=reset?0:W[i];
+      p[i*3]=ox[i*3]+D.x*w;p[i*3+1]=ox[i*3+1]+D.y*w;p[i*3+2]=ox[i*3+2]+D.z*w;
+    }
+    acc.fill(0);
+    for(let i=0;i<N;i+=3){
+      const a=i*3,b=a+3,d=a+6;
+      const e1x=p[b]-p[a],e1y=p[b+1]-p[a+1],e1z=p[b+2]-p[a+2];
+      const e2x=p[d]-p[a],e2y=p[d+1]-p[a+1],e2z=p[d+2]-p[a+2];
+      const nx=e1y*e2z-e1z*e2y,ny=e1z*e2x-e1x*e2z,nz=e1x*e2y-e1y*e2x;
+      for(let j=0;j<3;j++){const u=uid[i+j]*3;acc[u]+=nx;acc[u+1]+=ny;acc[u+2]+=nz}
+    }
+    const n=nor.array;
+    for(let i=0;i<N;i++){
+      const u=uid[i]*3,x=acc[u],y=acc[u+1],z=acc[u+2],l=Math.hypot(x,y,z)||1;
+      n[i*3]=x/l;n[i*3+1]=y/l;n[i*3+2]=z/l;
+    }
+    pos.needsUpdate=true;nor.needsUpdate=true;
+  }
+
+  /* ---------- ввод ---------- */
+  const ray=new THREE.Raycaster(),ndc=new THREE.Vector2();
+  const plane=new THREE.Plane(),gw=new THREE.Vector3(),tmp=new THREE.Vector3(),inv=new THREE.Quaternion();
+  function setNDC(e){
+    const r=renderer.domElement.getBoundingClientRect();
+    ndc.set((e.clientX-r.left)/r.width*2-1,-((e.clientY-r.top)/r.height)*2+1);
+    ray.setFromCamera(ndc,camera);
+  }
+  function hitBall(e){setNDC(e);g.updateMatrixWorld();return ray.intersectObject(ball)[0]}
+
+  let vx=0,vy=0,mode=null,lx=0,ly=0,hammerOn=false,hs=null;
+
+  toolBtn.addEventListener('click',()=>{
+    hammerOn=!hammerOn;
+    toolBtn.classList.toggle('on',hammerOn);
+    stage.classList.toggle('hammer',hammerOn);
+    hint.textContent=hammerOn?'Тапни по шару — бах!':'Тяни шар — он растянется как слайм';
+  });
+
+  stage.addEventListener('pointerdown',e=>{
+    stage.setPointerCapture(e.pointerId);
+    const hit=hitBall(e);
+    if(hit&&hammerOn){
+      if(hs)return;
+      hs={t0:performance.now(),hit:hit.point.clone(),struck:false};
+      hammer.visible=true;return;
+    }
+    if(hit){
+      mode='grab';
+      gw.copy(hit.point);
+      camera.getWorldDirection(tmp);plane.setFromNormalAndCoplanarPoint(tmp,gw);
+      setCenter(g.worldToLocal(gw.clone()),1.15);
+      k=90;c=11;target.set(0,0,0);
+    }else{mode='rot';lx=e.clientX;ly=e.clientY}
+  });
+  const release=()=>{if(mode==='grab'){k=130;c=3.2;target.set(0,0,0)}mode=null};
+  stage.addEventListener('pointerup',release);
+  stage.addEventListener('pointercancel',release);
   stage.addEventListener('pointermove',e=>{
-    if(!drag)return;
-    vx=(e.clientX-lx)*.006;vy=(e.clientY-ly)*.006;
-    g.rotation.y+=vx;g.rotation.x+=vy;
-    lx=e.clientX;ly=e.clientY;
+    if(mode==='rot'){
+      vx=(e.clientX-lx)*.006;vy=(e.clientY-ly)*.006;
+      g.rotation.y+=vx;g.rotation.x+=vy;
+      lx=e.clientX;ly=e.clientY;
+    }else if(mode==='grab'){
+      setNDC(e);
+      if(ray.ray.intersectPlane(plane,tmp)){
+        tmp.sub(gw);
+        if(tmp.length()>3)tmp.setLength(3);
+        inv.copy(g.quaternion).invert();
+        target.copy(tmp).applyQuaternion(inv);
+      }
+    }
   });
 
   const still=matchMedia('(prefers-reduced-motion:reduce)').matches;
@@ -68,15 +172,55 @@ img.onload=()=>{
   }
   addEventListener('resize',size);size();
 
-  (function loop(){
+  /* ---------- удар молота ---------- */
+  function strike(){
+    g.updateMatrixWorld();
+    const hl=g.worldToLocal(hs.hit.clone());
+    setCenter(hl,1.0);
+    D.set(0,0,0);
+    Vd.copy(hl).normalize().multiplyScalar(-9);
+    k=150;c=3.5;target.set(0,0,0);
+  }
+  function updateHammer(now){
+    const t=(now-hs.t0)/1000;let h=0,rz=.12;
+    if(t<.22){const p=t/.22,e=p*p;h=1.8*(1-e);rz=.75-.63*e}
+    else{
+      if(!hs.struck){hs.struck=true;strike()}
+      if(t<.55){h=0}
+      else{const q=(t-.55)/.35;h=1.8*q*q;rz=.12+.5*q;if(q>=1){hammer.visible=false;hs=null;return}}
+    }
+    hammer.position.set(hs.hit.x,hs.hit.y+h,hs.hit.z+.25);
+    hammer.rotation.z=rz;
+  }
+
+  /* ---------- цикл ---------- */
+  let last=performance.now();
+  (function loop(now){
     requestAnimationFrame(loop);
-    if(!drag){
-      if(!still)g.rotation.y+=vx;
-      vx+=(.008-vx)*.02;
-      g.rotation.x+=vy;vy*=.92;
+    const dt=Math.min((now-last)/1000,.033);last=now;
+    if(hs)updateHammer(now);
+
+    // пружина
+    if(mode==='grab'||deformed||Vd.lengthSq()>0){
+      for(let s=0;s<2;s++){
+        const h=dt/2;
+        Vd.x+=((target.x-D.x)*k-Vd.x*c)*h;
+        Vd.y+=((target.y-D.y)*k-Vd.y*c)*h;
+        Vd.z+=((target.z-D.z)*k-Vd.z*c)*h;
+        D.addScaledVector(Vd,h);
+      }
+      const rest=mode!=='grab'&&D.lengthSq()<1e-6&&Vd.lengthSq()<1e-5;
+      if(rest){D.set(0,0,0);Vd.set(0,0,0);applyDeform(true);deformed=false}
+      else{applyDeform(false);deformed=true}
+    }
+
+    const busy=mode==='grab'||deformed||hs;
+    if(mode!=='rot'){
+      g.rotation.y+=vx;g.rotation.x+=vy;
+      vx*=.92;vy*=.92;
     }
     renderer.render(scene,camera);
-  })();
+  })(last);
 };
 img.src="./img/verity.png";
 </script></body></html>
